@@ -1,0 +1,94 @@
+pipeline {
+    agent any
+    
+    environment {
+        REPO_URL = "010928183449.dkr.ecr.ap-south-1.amazonaws.com/qma-docker-repo"
+        REGION   = "ap-south-1"
+        
+        DOCKER_BUILD_IP = "172.31.35.215"
+        APP_SERVER_IP   = "172.31.32.193" 
+        
+        SSH_CRED_ID     = "ssh-ec2-general" 
+
+        AWS_ACCESS_KEY_ID     = credentials('aws-access-key-id')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
+    }
+
+    stages {
+        stage('Stage 1: Pull from GitHub') {
+            steps {
+                git branch: 'dev', url: 'https://github.com/teena/qma-spring.git'
+            }
+        }
+
+        stage('Stage 2: Transfer & Build (on Docker EC2)') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: "${SSH_CRED_ID}", keyFileVariable: 'SSH_KEY')]) {
+                    sh """
+                        # Copy code to Docker instance
+                        ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ubuntu@${DOCKER_BUILD_IP} "mkdir -p ~/build-zone"
+                        scp -o StrictHostKeyChecking=no -i ${SSH_KEY} -r ./* ubuntu@${DOCKER_BUILD_IP}:~/build-zone/
+                        
+                        # Build the image
+                        ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ubuntu@${DOCKER_BUILD_IP} "cd ~/build-zone && docker build -t quantity-api ."
+                    """
+                }
+            }
+        }
+
+        stage('Stage 3: Tag & Login (on Docker Instance)') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: "${SSH_CRED_ID}", keyFileVariable: 'SSH_KEY')]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ubuntu@${DOCKER_BUILD_IP} << EOF
+                            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+                            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+                            
+                            aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${REPO_URL}
+                            docker tag quantity-api:latest ${REPO_URL}:latest
+EOF
+                    """
+                }
+            }
+        }
+
+        stage('Stage 4: Push to ECR (from Docker Instance)') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: "${SSH_CRED_ID}", keyFileVariable: 'SSH_KEY')]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ubuntu@${DOCKER_BUILD_IP} << EOF
+                            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+                            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+                            
+                            docker push ${REPO_URL}:latest
+                            rm -rf ~/build-zone # Clean up source code for minimal space consumption
+EOF
+                    """
+                }
+            }
+        }
+
+        stage('Stage 5: Pull & Run (on backend / api server qma)') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: "${SSH_CRED_ID}", keyFileVariable: 'SSH_KEY')]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ubuntu@${APP_SERVER_IP} << EOF
+                            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+                            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+                            
+                            # Login and Pull
+                            aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${REPO_URL}
+                            docker pull ${REPO_URL}:latest
+                            
+                            # Deploy
+                            docker rm -f quantity-api || true
+                            docker run -d --name quantity-api -p 8081:8081 ${REPO_URL}:latest
+                            
+                            docker system prune -f # Keep production disk clean
+EOF
+                    """
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,57 @@
+pipeline {
+    agent any
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'dev',
+                url: 'https://github.com/teena/qma-spring.git'
+            }
+        }
+
+        stage('Copy Config Files') {
+            steps {
+                sh '''
+                cp -f /config-file/application.properties \
+                  src/main/resources/application.properties
+                cp -f /config-file/pom.xml \
+                  pom.xml
+                '''
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh '''
+                mvn clean package -DskipTests
+                '''
+            }
+        }
+
+stage('Deploy') {
+    steps {
+        sh '''
+       scp -o StrictHostKeyChecking=no \
+          target/quantity-measurement-app-0.0.1-SNAPSHOT.jar \
+          ubuntu@172.31.32.193:/app/QuantityMeasurementApp/target/quantity-measurement-app-0.0.1-SNAPSHOT.jar
+        ssh -o StrictHostKeyChecking=no ubuntu@172.31.32.193 \
+          "sudo systemctl restart quantityapp"
+        ssh -o StrictHostKeyChecking=no ubuntu@172.31.32.193 \
+          "sudo systemctl is-active quantityapp"
+        '''
+    }
+
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline Success'
+        }
+
+        failure {
+            echo 'Pipeline Failed'
+        }
+    }
+}
